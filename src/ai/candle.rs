@@ -1,8 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{backend::BackendDevice, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-use tokenizers::Tokenizer;
+use tokenizers::{PaddingParams, Tokenizer};
 pub struct TextEmbedder {
     model: BertModel,
     tokenizer: Tokenizer,
@@ -26,7 +26,7 @@ impl TextEmbedder {
         };
 
         // 加载tokenizer
-        let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_id))
+        let mut tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_id))
             .map_err(|e| anyhow::anyhow!(e))?;
 
         // 加载模型配置
@@ -42,6 +42,17 @@ impl TextEmbedder {
 
         // 加载模型
         let model = BertModel::load(vb, &config)?;
+
+        // Setting the padding strategy for the tokenizer
+        if let Some(pp) = tokenizer.get_padding_mut() {
+            pp.strategy = tokenizers::PaddingStrategy::BatchLongest
+        } else {
+            let pp = PaddingParams {
+                strategy: tokenizers::PaddingStrategy::BatchLongest,
+                ..Default::default()
+            };
+            tokenizer.with_padding(Some(pp));
+        }
 
         if debug {
             log::debug!("model_id: {}", model_id);
@@ -64,6 +75,59 @@ impl TextEmbedder {
             normalize_embeddings,
             debug,
         })
+    }
+
+
+    pub fn get_embeddings(&self,sentence: &str) -> Result<Tensor> {
+        let start_time=chrono::Utc::now();
+        // drop any non-ascii characters
+        let sentence = sentence
+            .chars()
+            .filter(|c| c.is_ascii())
+            .collect::<String>();
+    
+        let tokens = self.tokenizer
+            .encode_batch(vec![sentence], true)
+            .map_err(anyhow::Error::msg)
+            .context("Unable to encode sentence")?;
+    
+        let token_ids = tokens
+            .iter()
+            .map(|tokens| {
+                let tokens = tokens.get_ids().to_vec();
+                Ok(Tensor::new(tokens.as_slice(), &self.device)?)
+            })
+            .collect::<Result<Vec<_>>>()
+            .context("Unable to get token ids")?;
+    
+        let token_ids = Tensor::stack(&token_ids, 0).context("Unable to stack token ids")?;
+        let token_type_ids = token_ids
+            .zeros_like()
+            .context("Unable to get token type ids")?;
+    
+        let attention_mask = token_ids.ones_like().context("Unable to create attention mask")?;
+        let embeddings = self.model
+            .forward(&token_ids, &token_type_ids, Some(&attention_mask))
+            .context("Unable to get embeddings")?;
+    
+        let (_n_sentence, n_tokens, _hidden_size) = embeddings
+            .dims3()
+            .context("Unable to get embeddings dimensions")?;
+        let embeddings =
+            (embeddings.sum(1)? / (n_tokens as f64)).context("Unable to get embeddings sum")?;
+        let mut embeddings = embeddings
+            .broadcast_div(&embeddings.sqr()?.sum_keepdim(1)?.sqrt()?)
+            .context("Unable to get embeddings broadcast div")?;
+
+        if self.normalize_embeddings {
+            embeddings = self.normalize_l2(&embeddings)?;
+        }
+
+        let end_time=chrono::Utc::now();
+        if self.debug {
+            log::debug!("get_embeddings cost: {} ms", end_time.signed_duration_since(start_time).num_milliseconds());
+        }
+        Ok(embeddings)
     }
 
     pub fn embed_text(&self, text: &str) -> anyhow::Result<Tensor> {
